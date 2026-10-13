@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import requests
 import pandas as pd
 import dns.resolver
@@ -19,7 +20,11 @@ IGNORAR_DOMINIOS = {
     "forms.gle", "sites.google.com", "notion.so"
 }
 
-# ---- utilidades ----
+# Extensões falsas comuns capturadas por Regex em atributos HTML/CSS
+EXTENSOES_INVALIDAS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".js", ".css"}
+
+# ---- UTILIDADES ----
+
 def limpar_host(url_ou_host: str) -> str:
     if not isinstance(url_ou_host, str):
         return ""
@@ -39,6 +44,7 @@ def limpar_host(url_ou_host: str) -> str:
         s = s.split(":", 1)[0]
     return s
 
+
 def normalizar_email(e: str) -> str:
     if not isinstance(e, str):
         return ""
@@ -52,9 +58,15 @@ def normalizar_email(e: str) -> str:
         return ""
     local, dom = e.split("@", 1)
     dom = limpar_host(dom)
+    
+    # Filtra falsos e-mails vindos de imagens ou arquivos do site
+    if any(dom.endswith(ext) for ext in EXTENSOES_INVALIDAS):
+        return ""
+        
     if not local or not dom:
         return ""
     return f"{local}@{dom}"
+
 
 def limpar_lista_emails_str(celula: str) -> str:
     if not isinstance(celula, str) or not celula.strip():
@@ -68,60 +80,98 @@ def limpar_lista_emails_str(celula: str) -> str:
             limpos.append(ne)
     return ", ".join(limpos)
 
-# ---- MX cache ----
+# ---- CACHE E VALIDAÇÃO MX ----
+
 _mx_cache: dict[str, bool] = {}
+
 def dominio_tem_mx(dominio: str) -> bool:
     if not dominio:
         return False
     if dominio in _mx_cache:
         return _mx_cache[dominio]
-    try:
-        ans = dns.resolver.resolve(dominio, "MX")
-        ok = len(ans) > 0
-    except Exception:
-        ok = False
+    
+    # Testa o subdomínio exato e a raiz caso seja um subdomínio
+    dominios_para_testar = [dominio]
+    partes = dominio.split(".")
+    if len(partes) > 2:
+        dominios_para_testar.append(".".join(partes[-2:]))
+
+    ok = False
+    for d in dominios_para_testar:
+        try:
+            ans = dns.resolver.resolve(d, "MX")
+            if len(ans) > 0:
+                ok = True
+                break
+        except Exception:
+            continue
+
     _mx_cache[dominio] = ok
     return ok
 
-# ---- scraping ----
+# ---- EXTRAÇÃO (SCRAPING) ----
+
 def extrair_emails_site(url: str) -> list[str]:
-    try:
-        html = requests.get(url, timeout=12, headers={"User-Agent":"Mozilla/5.0"}).text
-        brutos = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", html, flags=re.I)
-        limpos, vistos = [], set()
-        for e in brutos:
-            ne = normalizar_email(e)
-            if ne and ne not in vistos:
-                vistos.add(ne)
-                limpos.append(ne)
-        return limpos
-    except Exception:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    urls_para_testar = [url]
+    if not url.startswith(("http://", "https://")):
+        urls_para_testar = [f"https://{url}", f"http://{url}"]
+
+    html = ""
+    for u in urls_para_testar:
+        try:
+            res = requests.get(u, timeout=10, headers=headers, verify=False)
+            if res.status_code == 200:
+                html = res.text
+                break
+        except Exception:
+            continue
+
+    if not html:
         return []
+
+    brutos = re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", html)
+    limpos, vistos = [], set()
+    for e in brutos:
+        ne = normalizar_email(e)
+        if ne and ne not in vistos:
+            vistos.add(ne)
+            limpos.append(ne)
+    return limpos
+
+# ---- EXECUÇÃO PRINCIPAL ----
 
 def main():
     if not os.path.exists(ARQUIVO):
-        print(f"Arquivo {ARQUIVO} não encontrado.")
+        print(f"Erro: Arquivo '{ARQUIVO}' não encontrado no diretório atual.")
         return
 
-    # lê sempre como texto
+    # Desativa avisos de certificados SSL não verificados
+    requests.packages.urllib3.disable_warnings()
+
     df = pd.read_excel(ARQUIVO, dtype=str).fillna("")
 
-    # limpa colunas já existentes com emails
+    # Limpa colunas já existentes com e-mails
     for col in list(df.columns):
         if "email" in col.lower():
             df[col] = df[col].apply(limpar_lista_emails_str)
 
-    # garante colunas para e-mails chutados
+    # Garante colunas para e-mails padronizados/chutados
     for col in PADROES_COLUNAS:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].astype(str).fillna("")
 
-    # garante colunas auxiliares
+    # Garante colunas auxiliares
     for aux in ["emails_extraidos", "mx_status", "mx_ok"]:
         if aux not in df.columns:
             df[aux] = ""
         df[aux] = df[aux].astype(str).fillna("")
+
+    print("Iniciando o processamento do arquivo...")
 
     for i, row in df.iterrows():
         site_raw = str(row.get("site", "") or row.get(df.columns[0], "")).strip()
@@ -134,7 +184,7 @@ def main():
             df.at[i, "mx_status"] = "host_invalido"
             continue
 
-        # ignorar redes sociais
+        # Ignorar redes sociais
         base = host
         base_tld2 = ".".join(base.split(".")[-2:]) if "." in base else base
         if base in IGNORAR_DOMINIOS or base_tld2 in IGNORAR_DOMINIOS:
@@ -144,14 +194,13 @@ def main():
             df.at[i, "mx_status"] = "ignorado_rede_social"
             continue
 
-        # extrair emails reais do site
+        # 1. Extrair e-mails reais do site
         if not str(df.at[i, "emails_extraidos"]).strip():
-            url_busca = site_raw if site_raw.startswith(("http://","https://")) else f"https://{host}"
-            extraidos = extrair_emails_site(url_busca)
+            extraidos = extrair_emails_site(site_raw)
             if extraidos:
                 df.at[i, "emails_extraidos"] = ", ".join(extraidos)
 
-        # verificar MX
+        # 2. Verificar MX do domínio
         if not dominio_tem_mx(host):
             for col in PADROES_COLUNAS:
                 df.at[i, col] = ""
@@ -162,13 +211,16 @@ def main():
             df.at[i, "mx_ok"] = "SIM"
             df.at[i, "mx_status"] = "mx_ok"
 
-        # gerar e-mails chutados
+        # 3. Gerar e-mails prováveis caso a coluna esteja vazia
         for col in PADROES_COLUNAS:
             if not str(df.at[i, col]).strip():
                 df.at[i, col] = f"{col}@{host}"
 
+        # Pausa de segurança de 0.5s entre requisições
+        time.sleep(0.5)
+
     df.to_excel(ARQUIVO, index=False)
-    print("Arquivo atualizado com e-mails chutados e extraídos.")
+    print(f"Processamento concluído com sucesso! O arquivo '{ARQUIVO}' foi atualizado.")
 
 if __name__ == "__main__":
     main()
